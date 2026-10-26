@@ -117,7 +117,12 @@ class SecurityIntegration(unittest.TestCase):
         r=self.http.post(self.base+'/mcp',headers={'Authorization':'Bearer '+self.keys['read'],'Origin':'https://evil.example'},json={})
         self.assertIn(r.status_code,[400,403])
         self.assertEqual(self.http.post(self.base+'/register',content=b'x'*(256*1024+1)).status_code,413)
-        self.assertEqual(self.http.post(self.core+'/phone/activity',content=b'x'*(256*1024+1),headers={'X-Auth-Token':self.keys['phone']}).status_code,413)
+        # Send only the oversized length: the Core must reject before reading
+        # the body. Sending the entire body races a TCP reset on Windows when
+        # BaseHTTPRequestHandler closes a connection with unread upload bytes.
+        with socket.create_connection(('127.0.0.1',urlparse(self.core).port),timeout=5) as sock:
+            sock.sendall((f'POST /phone/activity HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {256*1024+1}\r\nX-Auth-Token: {self.keys["phone"]}\r\nConnection: close\r\n\r\n').encode())
+            self.assertIn(b' 413 ',sock.recv(4096).split(b'\r\n',1)[0])
 
     def register(self):
         r=self.http.post(self.base+'/register',json={'client_name':'Integration test','redirect_uris':['http://127.0.0.1:18999/callback'],
