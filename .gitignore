@@ -1,18 +1,24 @@
-# secrets & local config
 .env
-server/.env
-
-# runtime data — never commit real screenshots
-server/data/
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.venv*/
+__pycache__/
+*.pyc
+*.log
+logs/
 data/
-
-# android build artifacts & signing keys
-android/build/
+private/
+*.db
+*.db-*
+*.sqlite*
 *.apk
 *.idsig
 *.jks
 *.keystore
-
-# python
-__pycache__/
-*.pyc
+*.p12
+android/build/
+dist/
+.workbuddy/

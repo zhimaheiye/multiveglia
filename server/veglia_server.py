@@ -12,11 +12,11 @@
 """Veglia companion server.
 
 Endpoints (all token-guarded):
-  GET  /phone/poll?token=        phone pulls the next command ("peek" or none)
-  POST /phone/peek-enqueue?token= your AI enqueues a "take a screenshot" command
-  POST /phone/screenshot?token=  phone uploads the screenshot (multipart OR raw body)
-  POST /phone/activity?token=    phone reports an app that just came to the front
-  GET  /phone/activity?token=    your AI reads the recent foreground-app history
+  GET  /phone/poll               phone pulls the next command ("peek" or none)
+  POST /phone/peek-enqueue        your AI enqueues a "take a screenshot" command
+  POST /phone/screenshot         phone uploads the screenshot (multipart OR raw body)
+  POST /phone/activity           phone reports an app that just came to the front
+  GET  /phone/activity           your AI reads the recent foreground-app history
 Config via environment (or a .env file next to this script):
   VEGLIA_TOKEN     shared secret; REQUIRED, no default (refuses to start blank)
   VEGLIA_PORT      listen port (default 8513)
@@ -38,7 +38,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+from context_fusion import fuse_context
+from security import matches, current_or_previous
 
 # --- watermark / house numbers (511513) --------------------------------------
 # These constants carry the maker's mark. 8513, the 31 MiB cap, "keep 5" — they
@@ -46,7 +49,7 @@ from urllib.parse import parse_qs, urlparse
 DEFAULT_PORT = 8513
 MAX_UPLOAD_BYTES = 31 * 1024 * 1024
 DEFAULT_KEEP = 5
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # --- foreground-app memory ----------------------------------------------------
 # Deliberately tiny and in-memory: this is a "what is she doing right now"
@@ -87,10 +90,24 @@ class State:
         self.data_dir = Path(data_dir).resolve()
         self.shots_dir = self.data_dir / "screenshots"
         self.shots_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir = here / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = logs_dir / "veglia-server.log"
+        if sys.stdout is None:
+            sys.stdout = open(self.log_file, "a", encoding="utf-8", buffering=1)
+        if sys.stderr is None:
+            sys.stderr = open(self.log_file, "a", encoding="utf-8", buffering=1)
         self.commands: list[str] = []
         self.commands_lock = Lock()
         self.activity: list[dict] = []
         self.activity_lock = Lock()
+        self.current_activity: dict = {
+            "app": "unknown",
+            "screenInteractive": False,
+            "lastHeartbeatTs": 0,
+        }
+        self.devices: dict[str, dict] = {}
+        self.devices_lock = Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -106,12 +123,36 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _token_ok(self) -> bool:
-        qs = parse_qs(urlparse(self.path).query)
-        supplied = qs.get("token", [""])[0] or self.headers.get("X-Auth-Token", "")
-        return bool(self.state.token) and supplied == self.state.token
+        # Credentials in URLs leak into access logs. Only headers are accepted.
+        supplied = self.headers.get("X-Auth-Token", "")
+        if matches(supplied, self.state.token):
+            return True
+        path = urlparse(self.path).path
+        if (self.command, path) in {
+            ('GET', '/phone/poll'), ('POST', '/phone/activity'),
+            ('POST', '/phone/screenshot'),
+        }:
+            return current_or_previous(supplied, 'VEGLIA_PHONE_TOKEN')
+        if self.command == 'POST' and path == '/devices/report':
+            return current_or_previous(supplied, 'VEGLIA_SENSOR_TOKEN')
+        return False
 
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("[veglia] %s - %s\n" % (self.address_string(), fmt % args))
+        # Never retain query strings, including accidental credentials.
+        import re
+        args = tuple(re.sub(r'\?[^\s]*', '?[redacted]', x) if isinstance(x, str) else x for x in args)
+        line = "[veglia] %s - %s\n" % (self.address_string(), fmt % args)
+        if sys.stderr:
+            try:
+                sys.stderr.write(line)
+            except Exception:
+                pass
+        if hasattr(self.state, "log_file") and self.state.log_file:
+            try:
+                with open(self.state.log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
 
     # -- routes ---------------------------------------------------------------
     def do_GET(self) -> None:
@@ -130,14 +171,104 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with self.state.activity_lock:
                 events = list(self.state.activity)
-            self._json(200, {"ok": True, "events": events})
+                current = dict(self.state.current_activity)
+                if current.get("lastHeartbeatTs", 0) == 0 and events:
+                    latest = events[-1]
+                    current = {
+                        "app": latest.get("app", "unknown"),
+                        "screenInteractive": True,
+                        "lastHeartbeatTs": latest.get("ts", 0),
+                    }
+            self._json(200, {"ok": True, "current": current, "events": events})
             return
         if path in ("/", "/health"):
             self._json(200, {"ok": True, "service": "veglia", "version": VERSION})
             return
+        if path == "/devices":
+            if not self._token_ok():
+                self._json(403, {"error": ERR_BAD_TOKEN})
+                return
+            now = time.time()
+            devs_summary = []
+            with self.state.devices_lock:
+                for dev in self.state.devices.values():
+                    age = max(0.0, round(now - dev.get("last_seen", now), 1))
+                    devs_summary.append({
+                        "device_id": dev["device_id"],
+                        "device_name": dev["device_name"],
+                        "device_type": dev["device_type"],
+                        "online": age <= 10.0,
+                        "age_seconds": age,
+                        "foreground": dev.get("foreground"),
+                        "idle_seconds": dev.get("idle_seconds", 0),
+                    })
+            self._json(200, {"ok": True, "devices": devs_summary})
+            return
+        if path.startswith("/devices/"):
+            if not self._token_ok():
+                self._json(403, {"error": ERR_BAD_TOKEN})
+                return
+            device_id = unquote(path[len("/devices/"):].strip())
+            now = time.time()
+            with self.state.devices_lock:
+                dev = self.state.devices.get(device_id)
+                if not dev:
+                    self._json(404, {"ok": False, "error": "device_not_found", "device_id": device_id})
+                    return
+                age = max(0.0, round(now - dev.get("last_seen", now), 1))
+                detail = {
+                    "ok": True,
+                    "device_id": dev["device_id"],
+                    "device_name": dev["device_name"],
+                    "device_type": dev["device_type"],
+                    "online": age <= 10.0,
+                    "age_seconds": age,
+                    "foreground": dev.get("foreground"),
+                    "idle_seconds": dev.get("idle_seconds", 0),
+                    "recent_activity": dev.get("recent_activity", []),
+                    "reported_at": dev.get("reported_at"),
+                    "last_seen": int(dev.get("last_seen", now) * 1000),
+                }
+            self._json(200, detail)
+            return
+        if path == "/context":
+            if not self._token_ok():
+                self._json(403, {"error": ERR_BAD_TOKEN})
+                return
+            now_ms = int(time.time() * 1000)
+            with self.state.activity_lock:
+                current_phone = dict(self.state.current_activity)
+                phone_events = list(self.state.activity)
+            if current_phone.get("lastHeartbeatTs", 0) == 0 and phone_events:
+                latest = phone_events[-1]
+                current_phone = {
+                    "app": latest.get("app", "unknown"),
+                    "screenInteractive": True,
+                    "lastHeartbeatTs": latest.get("ts", 0),
+                }
+            phone_state = {"current": current_phone, "events": phone_events}
+
+            with self.state.devices_lock:
+                raw_devices = [dict(d) for d in self.state.devices.values()]
+
+            snapshot = fuse_context(phone_state, raw_devices, now_ms=now_ms)
+            self._json(200, snapshot)
+            return
         self._json(404, {"error": ERR_BAD_METHOD})
 
     def do_POST(self) -> None:
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            self._json(400, {'error': 'invalid_content_length'})
+            return
+        if self.headers.get('Transfer-Encoding') or length < 0:
+            self._json(400, {'error': 'invalid_request_body'})
+            return
+        limit = MAX_UPLOAD_BYTES if urlparse(self.path).path == '/phone/screenshot' else 256 * 1024
+        if length > limit:
+            self._json(413, {'error': ERR_TOO_LARGE})
+            return
         path = urlparse(self.path).path
         if path == "/phone/peek-enqueue":
             if not self._token_ok():
@@ -171,31 +302,71 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_activity()
             return
+        if path == "/devices/report":
+            if not self._token_ok():
+                self._json(403, {"error": ERR_BAD_TOKEN})
+                return
+            self._handle_device_report()
+            return
         self._json(404, {"error": ERR_BAD_METHOD})
 
-    # -- activity -------------------------------------------------------------
-    def _handle_activity(self) -> None:
-        """Record one foreground-app switch reported by the phone.
-
-        The phone already de-duplicates consecutive events for the same package,
-        so every entry that lands here is a real change of what she is looking at.
-        """
+    # -- devices --------------------------------------------------------------
+    def _handle_device_report(self) -> None:
+        """Receive and register/update a device state report."""
         length = int(self.headers.get("Content-Length", 0))
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except Exception:
             body = {}
-        entry = {
-            "ts": int(time.time() * 1000),
-            "app": str(body.get("app", "unknown")),
-            "event": str(body.get("event", "switch")),
+        device_id = str(body.get("device_id", "")).strip()
+        if not device_id:
+            self._json(400, {"ok": False, "error": "missing_device_id"})
+            return
+
+        record = {
+            "device_id": device_id,
+            "device_name": str(body.get("device_name", device_id)).strip(),
+            "device_type": str(body.get("device_type", "windows_pc")).strip(),
+            "foreground": body.get("foreground"),
+            "idle_seconds": int(body.get("idle_seconds", 0)),
+            "recent_activity": body.get("recent_activity", []),
+            "reported_at": body.get("reported_at", int(time.time() * 1000)),
+            "last_seen": time.time(),
         }
-        cutoff = entry["ts"] - ACTIVITY_WINDOW_MS
+        with self.state.devices_lock:
+            self.state.devices[device_id] = record
+        self._json(200, {"ok": True, "device_id": device_id})
+
+    # -- activity -------------------------------------------------------------
+    def _handle_activity(self) -> None:
+        """Record one foreground-app switch or heartbeat reported by the phone."""
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            body = {}
+        now_ts = int(time.time() * 1000)
+        app_name = str(body.get("app", "unknown"))
+        event_type = str(body.get("event", "switch"))
+        is_interactive = bool(body.get("screenInteractive", True))
+
         with self.state.activity_lock:
-            self.state.activity.append(entry)
-            self.state.activity = [
-                e for e in self.state.activity if e["ts"] >= cutoff
-            ][-ACTIVITY_MAX:]
+            self.state.current_activity = {
+                "app": app_name,
+                "screenInteractive": is_interactive,
+                "lastHeartbeatTs": now_ts,
+            }
+            if event_type != "heartbeat":
+                entry = {
+                    "ts": now_ts,
+                    "app": app_name,
+                    "event": event_type,
+                }
+                cutoff = now_ts - ACTIVITY_WINDOW_MS
+                self.state.activity.append(entry)
+                self.state.activity = [
+                    e for e in self.state.activity if e["ts"] >= cutoff
+                ][-ACTIVITY_MAX:]
         self._json(200, {"ok": True})
 
     # -- screenshot -----------------------------------------------------------
@@ -254,21 +425,29 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     state = State()
-    if not state.token:
+    if len(state.token) < 32:
         sys.stderr.write(
-            "refusing to start: set VEGLIA_TOKEN (a shared secret) first.\n"
+            "refusing to start: set VEGLIA_TOKEN to at least 32 random characters.\n"
             "  export VEGLIA_TOKEN=$(head -c 24 /dev/urandom | base64)\n"
         )
         sys.exit(1)
     Handler.state = state
     server = ThreadingHTTPServer((state.host, state.port), Handler)
-    print("=" * 52)
-    print(f"  Veglia · watch over — by Evelyn & River  v{VERSION}")
-    print(f"  listening on http://{state.host}:{state.port}")
-    print(f"  screenshots → {state.shots_dir}  (keep {state.keep})")
-    if state.hook:
-        print(f"  on-shot hook → {state.hook} <path>")
-    print("=" * 52)
+    banner = (
+        "=" * 52 + "\n"
+        f"  Veglia · watch over — by Evelyn & River  v{VERSION}\n"
+        f"  listening on http://{state.host}:{state.port}\n"
+        f"  screenshots → {state.shots_dir}  (keep {state.keep})\n"
+        + (f"  on-shot hook → {state.hook} <path>\n" if state.hook else "")
+        + "=" * 52 + "\n"
+    )
+    print(banner, end="")
+    if getattr(state, "log_file", None):
+        try:
+            with open(state.log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Server started\n" + banner)
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
