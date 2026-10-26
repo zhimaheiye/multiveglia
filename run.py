@@ -14,6 +14,11 @@ def main():
     args=parser.parse_args()
     root=Path(__file__).resolve().parent
     server=root/'server'
+    if sys.stdout is None or sys.stderr is None:
+        (server/'logs').mkdir(exist_ok=True)
+        log=open(server/'logs'/('launcher-'+args.mode+'.log'),'a',encoding='utf-8',buffering=1)
+        if sys.stdout is None:sys.stdout=log
+        if sys.stderr is None:sys.stderr=log
     if not (server/'.env').exists() and not os.environ.get('VEGLIA_TOKEN'):
         raise SystemExit('Run setup.py (or Setup.cmd) first.')
     os.chdir(server)
