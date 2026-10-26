@@ -36,8 +36,12 @@ public class MainActivity extends Activity {
         homePackage = findViewById(R.id.homePackage);
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        serverUrl.setText(prefs.getString("server_url", ""));
-        tokenInput.setText(prefs.getString("token", ""));
+        String savedUrl = prefs.getString("server_url", "");
+        serverUrl.setText(savedUrl);
+
+        String savedToken = prefs.getString("token", "");
+        tokenInput.setText(savedToken);
+
         homePackage.setText(prefs.getString("home_package", ""));
 
         serviceRunning = CompanionService.isRunning();
