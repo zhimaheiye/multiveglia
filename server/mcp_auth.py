@@ -132,7 +132,9 @@ class OwnerOAuth(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToke
     async def consent(self, request):
         nonce = request.query_params.get('request', '')
         pending = self.get('pending', nonce)
-        headers = {'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer',
+        # HTML form POSTs use Origin: null under no-referrer. strict-origin
+        # preserves the form's Origin without disclosing paths or OAuth values.
+        headers = {'Cache-Control':'no-store', 'Referrer-Policy':'strict-origin',
                    'X-Frame-Options':'DENY', 'Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"}
         if not pending:
             return HTMLResponse('授权请求已过期，请从 Agent 重新连接。', status_code=400, headers=headers)
@@ -141,6 +143,12 @@ class OwnerOAuth(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToke
         client = await self.get_client(data['client_id'])
         if not client:
             return HTMLResponse('Client revoked.', status_code=400, headers=headers)
+        callback = urlparse(str(params.redirect_uri))
+        callback_source = f'{callback.scheme}://{callback.netloc}{callback.path or "/"}'
+        # Chromium applies form-action to the 303 redirect as well. Permit
+        # only this validated callback; keep scripts and framing disabled.
+        headers['Content-Security-Policy'] = headers['Content-Security-Policy'].replace(
+            "form-action 'self'", f"form-action 'self' {callback_source}")
         scopes = params.scopes or ['veglia:read']
         if request.method == 'POST':
             form = await request.form()

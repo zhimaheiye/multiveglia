@@ -49,7 +49,7 @@ from security import matches, current_or_previous
 DEFAULT_PORT = 8513
 MAX_UPLOAD_BYTES = 31 * 1024 * 1024
 DEFAULT_KEEP = 5
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 # --- foreground-app memory ----------------------------------------------------
 # Deliberately tiny and in-memory: this is a "what is she doing right now"

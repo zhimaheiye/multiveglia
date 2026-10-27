@@ -8,7 +8,7 @@
 
 ## 下载与首次运行
 
-从本仓库 Releases 下载 `MultiVeglia-0.7.0-windows-x64.zip` 和 `MultiVeglia-0.7.0.apk`。Windows 包包含 Python 和依赖，解压到你有写入权限的目录即可使用，无需安装 Python。
+从本仓库 Releases 下载 `MultiVeglia-0.7.1-windows-x64.zip` 和 `MultiVeglia-0.7.0.apk`（Android 本次无需更新）。Windows 包包含 Python 和依赖，解压到你有写入权限的目录即可使用，无需安装 Python。
 
 1. 双击 `Setup.cmd`：在本机生成六枚互不相同的随机凭据，已有配置不会被覆盖。
 2. 打开 `server/data/setup-credentials.txt` 查看手机 Token 和 Agent 凭据。**这个文件、`server/.env` 和整个 `server/data` 都是私密文件，不能上传。**

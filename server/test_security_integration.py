@@ -130,7 +130,7 @@ class SecurityIntegration(unittest.TestCase):
         self.assertEqual(r.status_code,201,r.text)
         return r.json()['client_id']
 
-    def authorize(self,client,scopes='veglia:read'):
+    def consent_page(self,client,scopes='veglia:read'):
         verifier=secrets.token_urlsafe(48)
         challenge=base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
         r=self.http.get(self.base+'/authorize',params={'client_id':client,'redirect_uri':'http://127.0.0.1:18999/callback',
@@ -139,12 +139,30 @@ class SecurityIntegration(unittest.TestCase):
         consent=r.headers['location']
         page=self.http.get(consent)
         self.assertEqual(page.status_code,200,page.text)
+        self.assertEqual(page.headers['referrer-policy'],'strict-origin')
+        policy=page.headers['content-security-policy']
+        self.assertIn("form-action 'self' http://127.0.0.1:18999/callback;",policy)
+        self.assertIn("default-src 'none'",policy)
+        self.assertIn("frame-ancestors 'none'",policy)
         csrf=re.search('name="csrf" value="([^"]+)"',page.text).group(1)
+        return consent,csrf,verifier
+
+    def test_consent_rejects_cross_site_missing_cookie_and_bad_csrf(self):
+        consent,csrf,_=self.consent_page(self.register())
+        for origin in ['null','https://evil.example']:
+            bad=self.http.post(consent,headers={'Origin':origin},data={'csrf':csrf,'password':self.keys['owner'],'scope':'veglia:read','decision':'allow'})
+            self.assertEqual(bad.status_code,403)
+        with httpx2.Client(trust_env=False,timeout=10) as cookieless:
+            bad=cookieless.post(consent,headers={'Origin':self.base},data={'csrf':csrf,'password':self.keys['owner'],'scope':'veglia:read','decision':'allow'})
+            self.assertEqual(bad.status_code,403)
         bad=self.http.post(consent,data={'csrf':'wrong','password':self.keys['owner'],'scope':'veglia:read','decision':'allow'})
         self.assertEqual(bad.status_code,403)
         bad=self.http.post(consent,data={'csrf':csrf,'password':'wrong','scope':'veglia:read','decision':'allow'})
         self.assertEqual(bad.status_code,403)
-        good=self.http.post(consent,data={'csrf':csrf,'password':self.keys['owner'],'scope':'veglia:read','decision':'allow'})
+
+    def authorize(self,client,scopes='veglia:read'):
+        consent,csrf,verifier=self.consent_page(client,scopes)
+        good=self.http.post(consent,headers={'Origin':self.base},data={'csrf':csrf,'password':self.keys['owner'],'scope':'veglia:read','decision':'allow'})
         self.assertEqual(good.status_code,303,good.text)
         params=parse_qs(urlparse(good.headers['location']).query)
         self.assertEqual(params['state'],['test-state'])

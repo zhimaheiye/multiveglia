@@ -1,5 +1,12 @@
 # Changes
 
+## 0.7.1
+
+- Fix browser OAuth consent failing with `Invalid consent request`: use a strict-origin referrer policy so native form submissions preserve their Origin without exposing URL paths or authorization parameters.
+- Allow the validated OAuth callback in the consent page's form-action policy so Chromium can follow the authorization redirect back to the client.
+- Keep origin, CSRF and cookie checks enforced, and cover null/foreign origins, missing cookies and incorrect CSRF in regression tests.
+- Android remains at 0.7.0; existing phone, sensor and Agent credentials remain valid.
+
 ## 0.7.0
 
 Based on Veglia by Evelyn & River, with Windows multi-device sensing and deterministic context fusion.

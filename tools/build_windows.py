@@ -8,7 +8,7 @@ import urllib.request
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
-VERSION='0.7.0'
+VERSION='0.7.1'
 PYTHON='3.14.10'
 PYTHON_SHA256='90905e64a840557d8c1bc4f5b74db3d7ee85e3ffb217611cac1c7813acea4159'
 
